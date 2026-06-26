@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# piebald-memory-selector.sh — UserPromptSubmit hook.
+# Replica o "determine-which-memory-files-to-attach" do Claude Code, mas
+# determinístico e pré-turno, usando Gemini Flash como seletor.
+#
+# Fluxo:
+#   1. Lê o JSON do stdin, extrai o prompt do usuário.
+#   2. Monta um índice (nome :: descrição) das memórias em ~/.claude/memory/*.md.
+#   3. Gemini Flash escolhe até N memórias relevantes ao prompt.
+#   4. Lê o conteúdo das escolhidas e injeta como additionalContext.
+#
+# Princípios: rápido, degrade gracioso (nunca bloqueia a mensagem),
+# early-exit barato, e não duplica no Claude Code (só injeta no Piebald).
+
+set -uo pipefail
+
+MEM_DIR="$HOME/.claude/memory"
+MAX_MEM=5
+SEL_TIMEOUT=20
+LOG="$HOME/.claude/piebald-memory-selector.log"
+
+# ============================================================================
+# BACKEND DO SELETOR — HTTP direto (SEM spawn de CLI). Latência ~1s.
+# ----------------------------------------------------------------------------
+# Plano (decisão do usuário 2026-05-29):
+#   • AGORA (até 2026-06-18): "gemini" → POST cloudcode-pa.googleapis.com,
+#     token OAuth de ~/.gemini/oauth_creds.json (mantido fresco pela gemini CLI/
+#     Piebald). Modelo Flash-Lite. Fora da Anthropic = poupa rate da Max.
+#   • EM 2026-06-18 o Gemini CLI para de servir contas Google free/Pro/Ultra.
+#     Trocar SELECTOR_BACKEND="antigravity" (endpoint Antigravity) — ver
+#     antigravity_http() abaixo (a completar com o endpoint do agy/Piebald).
+#   • Fallback: "codex" (GPT-nano) — a implementar via HTTP se necessário.
+# Troca de backend = mudar SELECTOR_BACKEND ou exportar PIEBALD_SELECTOR_BACKEND.
+# ============================================================================
+SELECTOR_BACKEND="${PIEBALD_SELECTOR_BACKEND:-gemini}"
+GEMINI_MODEL="gemini-2.5-flash-lite"
+GEMINI_CREDS="$HOME/.gemini/oauth_creds.json"
+GEMINI_PROJECT_CACHE="$HOME/.claude/.piebald-gemini-project"
+CLOUDCODE="https://cloudcode-pa.googleapis.com/v1internal"
+# CRÍTICO: o User-Agent identifica o cliente como GeminiCLI (aprovado) e libera
+# a quota cheia. Sem ele, o Google aplica quota default mínima (~1 RPM) -> 429.
+# Copiado exatamente do que o Piebald envia (tabela http_headers, req id 3234).
+GEMINI_UA="GeminiCLI/0.37.1/gemini-2.5-flash-lite (win32; x64; terminal) google-api-nodejs-client/9.15.1"
+GEMINI_APICLIENT="gl-node/22.22.0"
+
+# call_model: recebe o prompt no stdin, devolve a resposta-texto no stdout.
+# Retorna != 0 em qualquer falha (o seletor degrada: não injeta nada).
+call_model() {
+  local prompt; prompt="$(cat)"
+  case "$SELECTOR_BACKEND" in
+    gemini)      gemini_http "$prompt" ;;
+    antigravity) antigravity_http "$prompt" ;;
+    *)           return 1 ;;
+  esac
+}
+
+# --- gemini via cloudcode-pa (OAuth token reusado, HTTP, ~1s) ---------------
+gemini_http() {
+  local prompt="$1" token project body resp text
+  [ -f "$GEMINI_CREDS" ] || { log "gemini_http: sem oauth_creds"; return 1; }
+  token="$(jq -r '.access_token // empty' "$GEMINI_CREDS" 2>/dev/null)"
+  [ -z "$token" ] && { log "gemini_http: sem token"; return 1; }
+
+  # project: cacheado; senão descobre via loadCodeAssist e grava
+  project=""
+  [ -f "$GEMINI_PROJECT_CACHE" ] && project="$(cat "$GEMINI_PROJECT_CACHE" 2>/dev/null)"
+  if [ -z "$project" ]; then
+    project="$(curl -s --max-time 8 -X POST "$CLOUDCODE:loadCodeAssist" \
+      -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+      -H "User-Agent: $GEMINI_UA" -H "x-goog-api-client: $GEMINI_APICLIENT" \
+      -d '{"metadata":{"pluginType":"GEMINI"}}' 2>/dev/null \
+      | jq -r '.cloudaicompanionProject // empty' 2>/dev/null)"
+    [ -n "$project" ] && printf '%s' "$project" > "$GEMINI_PROJECT_CACHE"
+  fi
+  [ -z "$project" ] && { log "gemini_http: sem project"; return 1; }
+
+  body="$(jq -n --arg m "$GEMINI_MODEL" --arg p "$project" --arg t "$prompt" \
+    '{model:$m,project:$p,request:{contents:[{role:"user",parts:[{text:$t}]}]}}')"
+  resp="$(curl -s --max-time "$SEL_TIMEOUT" -X POST "$CLOUDCODE:generateContent" \
+    -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+    -H "User-Agent: $GEMINI_UA" -H "x-goog-api-client: $GEMINI_APICLIENT" \
+    -d "$body" 2>/dev/null)"
+  text="$(printf '%s' "$resp" | jq -r '.response.candidates[0].content.parts[0].text // empty' 2>/dev/null)"
+  if [ -z "$text" ]; then
+    log "gemini_http: sem texto (err: $(printf '%s' "$resp" | jq -rc '.error.status // "?"' 2>/dev/null))"
+    return 1
+  fi
+  printf '%s' "$text"
+}
+
+# --- antigravity (PÓS 2026-06-18) — a completar com endpoint do agy/Piebald --
+antigravity_http() {
+  log "antigravity_http: backend ainda não implementado (migração 2026-06-18)"
+  return 1
+}
+
+# ---- helpers ----------------------------------------------------------------
+emit_nothing() { exit 0; }   # additionalContext vazio = nada injetado
+
+log() { echo "[$(date '+%H:%M:%S')] $*" >> "$LOG" 2>/dev/null || true; }
+
+# ---- 0. ler stdin -----------------------------------------------------------
+INPUT=""
+[ ! -t 0 ] && INPUT="$(cat 2>/dev/null || true)"
+[ -z "$INPUT" ] && emit_nothing
+
+# ---- 1. detectar cliente: só roda no Piebald --------------------------------
+# Claude Code tem @imports nativo; injetar lá duplicaria o contexto.
+# Heurística: Claude Code seta CLAUDE_PLUGIN_ROOT/transcript_path; Piebald não.
+# transcript_path é sempre null no Piebald (confirmado na doc + probe).
+if printf '%s' "$INPUT" | grep -q '"transcript_path":"[^"]'; then
+  # transcript_path com valor real => Claude Code => não injeta
+  log "skip: parece Claude Code (transcript_path presente)"
+  emit_nothing
+fi
+
+# ---- 2. early-exit se octo está orquestrando --------------------------------
+# Evita competir/poluir contexto durante um workflow octo deliberado.
+if [ -n "${OCTOPUS_WORKFLOW_PHASE:-}" ]; then
+  log "skip: octo workflow ativo ($OCTOPUS_WORKFLOW_PHASE)"
+  emit_nothing
+fi
+
+# ---- 3. extrair o prompt ----------------------------------------------------
+# Tenta jq; fallback pra python; fallback pra grep.
+PROMPT=""
+if command -v jq >/dev/null 2>&1; then
+  PROMPT="$(printf '%s' "$INPUT" | jq -r '.prompt // empty' 2>/dev/null)"
+fi
+if [ -z "$PROMPT" ] && command -v python >/dev/null 2>&1; then
+  PROMPT="$(printf '%s' "$INPUT" | python -c 'import json,sys;print(json.load(sys.stdin).get("prompt",""))' 2>/dev/null)"
+fi
+[ -z "$PROMPT" ] && { log "skip: prompt vazio"; emit_nothing; }
+
+# Ignora prompts triviais (saudações curtas) pra não gastar Flash à toa
+PLEN=${#PROMPT}
+if [ "$PLEN" -lt 8 ]; then
+  log "skip: prompt curto ($PLEN chars): $PROMPT"
+  emit_nothing
+fi
+
+# ---- 4. montar índice das memórias ------------------------------------------
+[ -d "$MEM_DIR" ] || { log "skip: sem dir de memória"; emit_nothing; }
+
+INDEX=""
+shopt -s nullglob
+for f in "$MEM_DIR"/*.md; do
+  name="$(basename "$f")"
+  [ "$name" = "MEMORY.md" ] && continue   # índice, não memória em si
+  # descrição: campo frontmatter 'description:' ou primeira linha não-vazia
+  desc="$(grep -m1 '^description:' "$f" 2>/dev/null | sed 's/^description:[[:space:]]*//')"
+  [ -z "$desc" ] && desc="$(grep -m1 -v '^[[:space:]]*$' "$f" 2>/dev/null | cut -c1-200)"
+  INDEX="${INDEX}- ${name} :: ${desc}"$'\n'
+done
+shopt -u nullglob
+
+[ -z "$INDEX" ] && { log "skip: índice vazio"; emit_nothing; }
+
+# ---- 5. Modelo seletor escolhe (backend plugável) ---------------------------
+SEL_PROMPT="Você seleciona memórias úteis para responder à mensagem do usuário.
+Mensagem do usuário: \"$PROMPT\"
+
+Memórias disponíveis (nome :: descrição):
+$INDEX
+Retorne APENAS os nomes de arquivo (um por linha, exatamente como aparecem) das memórias claramente relevantes para esta mensagem específica — no máximo $MAX_MEM. Seja seletivo e criterioso: relevância é sobre o que a mensagem TRATA, não sobreposição superficial de palavras. Se nenhuma for claramente útil, retorne apenas: NONE"
+
+SELECTED="$(printf '%s' "$SEL_PROMPT" | call_model)"
+RC=$?
+if [ $RC -ne 0 ] || [ -z "$SELECTED" ]; then
+  log "skip: backend '$SELECTOR_BACKEND' falhou/timeout (rc=$RC)"
+  emit_nothing
+fi
+
+# Normaliza saída e filtra só nomes que existem de fato
+CHOSEN=""
+while IFS= read -r line; do
+  fn="$(printf '%s' "$line" | tr -d '\r' | sed 's/^[[:space:]-]*//; s/[[:space:]]*$//')"
+  [ -z "$fn" ] && continue
+  [ "$fn" = "NONE" ] && continue
+  if [ -f "$MEM_DIR/$fn" ]; then
+    CHOSEN="${CHOSEN}${fn}"$'\n'
+  fi
+done <<< "$SELECTED"
+
+[ -z "$CHOSEN" ] && { log "no-match para: $PROMPT"; emit_nothing; }
+
+# ---- 6. montar additionalContext --------------------------------------------
+CONTEXT="<memories source=\"piebald-memory-selector\" note=\"Memórias relevantes do usuário selecionadas para esta mensagem. Considere-as como contexto persistente.\">"$'\n'
+while IFS= read -r fn; do
+  [ -z "$fn" ] && continue
+  CONTEXT="${CONTEXT}"$'\n'"### ${fn}"$'\n'"$(cat "$MEM_DIR/$fn" 2>/dev/null)"$'\n'
+  log "injetou: $fn"
+done <<< "$CHOSEN"
+CONTEXT="${CONTEXT}"$'\n'"</memories>"
+
+# Emite JSON UserPromptSubmit com additionalContext (escapado via jq se houver)
+if command -v jq >/dev/null 2>&1; then
+  jq -n --arg ctx "$CONTEXT" \
+    '{hookSpecificOutput:{hookEventName:"UserPromptSubmit",additionalContext:$ctx}}'
+else
+  # fallback: texto puro em stdout vira additionalContext (exit 0)
+  printf '%s\n' "$CONTEXT"
+fi
+exit 0

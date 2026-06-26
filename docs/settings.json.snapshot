@@ -1,0 +1,103 @@
+{
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  },
+  "env": {
+    "OCTOPUS_DISABLE_BARE": "1",
+    "OCTOPUS_AGENT_MAX_OUTPUT_BYTES": "0",
+    "OCTOPUS_CONTEXT_BUDGET": "200000",
+    "OCTOPUS_CODEX_CONTEXT_BUDGET": "400000",
+    "OCTOPUS_CODEX_LARGE_CONTEXT_BUDGET": "400000",
+    "OCTOPUS_GEMINI_CONTEXT_BUDGET": "1000000",
+    "OCTOPUS_CLAUDE_CONTEXT_BUDGET": "1000000",
+    "OCTOPUS_MAX_PARALLEL_AGENTS": "8",
+    "OCTOPUS_AGENT_TIMEOUT": "3600",
+    "OCTOPUS_COPILOT_TIMEOUT": "600",
+    "OCTOPUS_CURSOR_AGENT_TIMEOUT": "600",
+    "OCTOPUS_OPENCODE_TIMEOUT": "600",
+    "OCTOPUS_GITHUB_WORK_QUEUE_LIMIT": "10",
+    "CLAUDE_OCTOPUS_RALPH_MAX_ITERATIONS": "200"
+  },
+  "model": "opus[1m]",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "%USERPROFILE%\\bin\\rtk-hook.cmd"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%USERPROFILE%\\bin\\claude-cluster-pull.ps1\""
+          },
+          {
+            "type": "command",
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%USERPROFILE%\\bin\\mcp-summary-hook.ps1\""
+          },
+          {
+            "type": "command",
+            "command": "%USERPROFILE%\\bin\\piebald-cluster-context.cmd"
+          },
+          {
+            "type": "command",
+            "command": "%USERPROFILE%\\bin\\piebald-daemon-start.cmd"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "submit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "%USERPROFILE%\\bin\\piebald-memory-selector.cmd"
+          }
+        ]
+      }
+    ],
+    "Stop": []
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%USERPROFILE%\\.claude\\statusline.ps1\""
+  },
+  "enabledPlugins": {
+    "claude-code-setup@claude-plugins-official": true,
+    "claude-md-management@claude-plugins-official": true,
+    "commit-commands@claude-plugins-official": true,
+    "superpowers@claude-plugins-official": true,
+    "octo@nyldn-plugins": true
+  },
+  "extraKnownMarketplaces": {
+    "nyldn-plugins": {
+      "source": {
+        "source": "git",
+        "url": "https://github.com/nyldn/plugins.git"
+      }
+    }
+  },
+  "language": "portuguese",
+  "autoUpdatesChannel": "latest",
+  "voice": {
+    "enabled": true,
+    "mode": "hold"
+  },
+  "skipDangerousModePermissionPrompt": true,
+  "theme": "dark-daltonized",
+  "editorMode": "normal",
+  "autoCompactEnabled": true,
+  "remoteControlAtStartup": true,
+  "agentPushNotifEnabled": true,
+  "voiceEnabled": true,
+  "mcpServers": {}
+}

@@ -1,0 +1,18 @@
+# build artifacts
+*.exe
+src/piebald-memory-daemon
+
+# secrets / runtime — NUNCA versionar
+*.piebald-daemon-token
+oauth_creds.json
+.piebald-gemini-project
+*.log
+*.events.jsonl
+
+# local progress/tracking notes — host-local, not for the public repo
+progress-log.md
+
+# go
+/src/vendor/
+__pycache__/
+*.pyc
