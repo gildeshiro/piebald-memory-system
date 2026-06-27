@@ -1,7 +1,4 @@
 {
-  "permissions": {
-    "defaultMode": "bypassPermissions"
-  },
   "env": {
     "OCTOPUS_DISABLE_BARE": "1",
     "OCTOPUS_AGENT_MAX_OUTPUT_BYTES": "0",
@@ -18,15 +15,26 @@
     "OCTOPUS_GITHUB_WORK_QUEUE_LIMIT": "10",
     "CLAUDE_OCTOPUS_RALPH_MAX_ITERATIONS": "200"
   },
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  },
   "model": "opus[1m]",
   "hooks": {
-    "PreToolUse": [
+    "UserPromptSubmit": [
       {
-        "matcher": "Bash",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "%USERPROFILE%\\bin\\rtk-hook.cmd"
+            "command": "C:\\Users\\carla\\bin\\piebald-memory-selector.cmd"
+          },
+          {
+            "type": "command",
+            "command": "C:\\Users\\carla\\bin\\fullstep-wake-hook.cmd"
+          },
+          {
+            "type": "command",
+            "command": "C:\\Users\\carla\\bin\\bg-wake-hook.cmd"
           }
         ]
       }
@@ -37,39 +45,33 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%USERPROFILE%\\bin\\claude-cluster-pull.ps1\""
-          },
-          {
-            "type": "command",
-            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%USERPROFILE%\\bin\\mcp-summary-hook.ps1\""
-          },
-          {
-            "type": "command",
-            "command": "%USERPROFILE%\\bin\\piebald-cluster-context.cmd"
-          },
-          {
-            "type": "command",
-            "command": "%USERPROFILE%\\bin\\piebald-daemon-start.cmd"
+            "command": "C:\\Users\\carla\\bin\\piebald-daemon-start.cmd"
           }
         ]
       }
     ],
-    "UserPromptSubmit": [
+    "PreToolUse": [
       {
-        "matcher": "submit",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "%USERPROFILE%\\bin\\piebald-memory-selector.cmd"
+            "command": "C:\\Users\\carla\\bin\\rtk-test-hook.cmd",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "Agent|LaunchSubagent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:\\Projects\\piebald-dynamic-subagents\\hooks\\pretooluse-route.cmd",
+            "timeout": 10
           }
         ]
       }
-    ],
-    "Stop": []
-  },
-  "statusLine": {
-    "type": "command",
-    "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%USERPROFILE%\\.claude\\statusline.ps1\""
+    ]
   },
   "enabledPlugins": {
     "claude-code-setup@claude-plugins-official": true,

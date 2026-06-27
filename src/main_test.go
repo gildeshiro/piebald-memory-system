@@ -133,7 +133,7 @@ func TestLocalSelectBM25(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		big[string(rune('a'+i))+".md"] = "memory daemon latency"
 	}
-	if got = localSelect("memory daemon latency", big, maxSkill); len(got) > maxSkill {
+	if got = localSelect("memory daemon latency", big, 3); len(got) > 3 {
 		t.Fatalf("excedeu limite: %d", len(got))
 	}
 }

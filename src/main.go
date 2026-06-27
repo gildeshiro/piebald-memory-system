@@ -45,31 +45,22 @@ import (
 const (
 	listenAddr  = "127.0.0.1:8099"
 	maxMem      = 5
-	maxSkill    = 3
 	minPromptLn = 8
 	maxLogBytes = 2 << 20 // 2 MiB: rotaciona logs acima disso (Wave 3: observability)
-	skillTTL    = 5 * time.Minute
 )
 
 var (
-	home             = os.Getenv("USERPROFILE")
-	memDir           = filepath.Join(os.Getenv("USERPROFILE"), ".claude", "memory")
-	logPath          = filepath.Join(os.Getenv("USERPROFILE"), ".claude", "piebald-memory-daemon.log")
-	eventsPath       = filepath.Join(os.Getenv("USERPROFILE"), ".claude", "piebald-memory-daemon.events.jsonl")
-	tokenPath        = filepath.Join(os.Getenv("USERPROFILE"), ".claude", ".piebald-daemon-token")
-	pluginsCacheRoot = filepath.Join(os.Getenv("USERPROFILE"), ".claude", "plugins", "cache")
+	home        = os.Getenv("USERPROFILE")
+	memDir      = filepath.Join(os.Getenv("USERPROFILE"), ".claude", "memory")
+	logPath     = filepath.Join(os.Getenv("USERPROFILE"), ".claude", "piebald-memory-daemon.log")
+	eventsPath  = filepath.Join(os.Getenv("USERPROFILE"), ".claude", "piebald-memory-daemon.events.jsonl")
+	tokenPath   = filepath.Join(os.Getenv("USERPROFILE"), ".claude", ".piebald-daemon-token")
 	// Cliente HTTP com keepalive (reusa conexão TLS entre requests = sem handshake).
 	httpClient  = &http.Client{Timeout: 15 * time.Second}
 	daemonToken string
 
 	// Mutexes granulares (tráfego é ~1 req/mensagem; corretude > paralelismo).
 	saveMu sync.Mutex // /save: arquivo de memória + append em MEMORY.md
-
-	// cache do catálogo de skills (scan raro; TTL 5min). Wave 3: skill fold-in.
-	skillMu         sync.Mutex
-	skillIdxCache   string
-	skillDescsCache map[string]string
-	skillCacheAt    time.Time
 
 	// neutraliza tags de fechamento que escapariam o bloco <memories> injetado.
 	closeTagRe = regexp.MustCompile(`(?i)<\s*/\s*memor(y|ies)\s*>`)
@@ -99,9 +90,7 @@ type selectEvent struct {
 	CwdHash   string   `json:"cwd_hash"`
 	PromptLen int      `json:"prompt_len"`
 	MemCand   int      `json:"mem_candidates"`
-	SkillCand int      `json:"skill_candidates"`
 	MemSel    []string `json:"mem_selected"`
-	SkillSel  []string `json:"skill_selected"`
 	Backend   string   `json:"backend"`
 	LatencyMs int64    `json:"latency_ms"`
 }
@@ -334,90 +323,6 @@ func extractDesc(path string) string {
 	return ""
 }
 
-// extractName: lê o campo frontmatter `name:` (canônico p/ skills).
-func extractName(path string) string {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	for _, line := range strings.Split(string(b), "\n") {
-		l := strings.TrimSpace(line)
-		if strings.HasPrefix(l, "name:") {
-			return strings.Trim(strings.TrimSpace(strings.TrimPrefix(l, "name:")), `"'`)
-		}
-	}
-	return ""
-}
-
-// extractPreview: primeiras ~160 chars do CORPO (após o frontmatter) — dá ao
-// seletor sinal além da description (Wave 3: selection quality).
-func extractPreview(path string) string {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	s := string(b)
-	// pula o frontmatter (entre o 1º e o 2º "---")
-	if strings.HasPrefix(strings.TrimSpace(s), "---") {
-		if idx := strings.Index(s, "---"); idx >= 0 {
-			if end := strings.Index(s[idx+3:], "---"); end >= 0 {
-				s = s[idx+3+end+3:]
-			}
-		}
-	}
-	var parts []string
-	for _, line := range strings.Split(s, "\n") {
-		l := strings.TrimSpace(line)
-		if l == "" || strings.HasPrefix(l, "#") || strings.HasPrefix(l, "[host:") {
-			continue
-		}
-		parts = append(parts, l)
-		if len(strings.Join(parts, " ")) > 160 {
-			break
-		}
-	}
-	pv := strings.Join(parts, " ")
-	if len(pv) > 160 {
-		pv = pv[:160]
-	}
-	return pv
-}
-
-// skillIndex: catálogo de skills instaladas (cache com TTL). Dedup por nome.
-// Wave 3: skill fold-in — surface dinâmica em vez da tabela estática só no prompt.
-func skillIndex() (string, map[string]string) {
-	skillMu.Lock()
-	defer skillMu.Unlock()
-	if skillIdxCache != "" && time.Since(skillCacheAt) < skillTTL {
-		return skillIdxCache, skillDescsCache
-	}
-	descs := map[string]string{}
-	matches, _ := filepath.Glob(filepath.Join(pluginsCacheRoot, "*", "*", "*", "skills", "*", "SKILL.md"))
-	for _, p := range matches {
-		name := extractName(p)
-		if name == "" {
-			name = filepath.Base(filepath.Dir(p))
-		}
-		if _, seen := descs[name]; seen {
-			continue
-		}
-		descs[name] = extractDesc(p)
-	}
-	names := make([]string, 0, len(descs))
-	for n := range descs {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	var sb strings.Builder
-	for _, n := range names {
-		sb.WriteString("- " + n + " :: " + descs[n] + "\n")
-	}
-	skillIdxCache = sb.String()
-	skillDescsCache = descs
-	skillCacheAt = time.Now()
-	return skillIdxCache, descs
-}
-
 // ---- fallback BM25 local (determinístico, zero-rede) -----------------------
 // Usado quando o embedder falha (sem key/rede/rate-limit). Garante que a
 // memória sobrevive a outages e que a busca nunca para — só degrada de
@@ -560,7 +465,7 @@ func handleSelect(w http.ResponseWriter, req *http.Request) {
 	// nativo (<available_agent_skills>) no início da sessão — o surfacing de
 	// skill do daemon era REDUNDANTE (e gastava embedding por turno). Removido
 	// 2026-06-15. O daemon foca só em memória, que é o gap real do Piebald.
-	mems, _, ok := selectByEmbedding(prompt, files, memEmbed, nil)
+	mems, ok := selectByEmbedding(prompt, files, memEmbed)
 	backend := "embed"
 	if !ok {
 		// Fallback BM25 DESATIVADO (decisão do dono, 2026-06-18): sem

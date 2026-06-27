@@ -54,7 +54,6 @@ var (
 	embedModelFile     = filepath.Join(home, ".openrouter-embed-model")
 	embedModelOverride string // só p/ testes
 	cutoffFile         = filepath.Join(home, ".openrouter-embed-cutoff")
-	skillVecPath       = filepath.Join(home, ".claude", ".piebald-skill-vectors.json")
 	// cosseno mínimo absoluto p/ injetar (decide "NONE"). Default conservador;
 	// calibrado empiricamente na verificação da W1 + eval da W4.
 	embedCutoff = 0.35
@@ -314,11 +313,12 @@ func topCosine(q []float32, vecs map[string][]float32, limit int, cutoff float64
 // ---- entrada de alto nível: seleção combinada por embedding ----------------
 // memEmbed: display -> texto a embedar (mesmo texto da linha do índice).
 // memFiles: display -> path (p/ agrupar o sidecar por dir).
-// skDescs:  nome de skill -> descrição.
-// ok=false => backend falhou (sem key / rede / rate-limit) -> caller usa BM25.
-func selectByEmbedding(prompt string, memFiles, memEmbed, skDescs map[string]string) (mems, skills []string, ok bool) {
+// ok=false => backend falhou (sem key / rede / rate-limit) -> caller loga e não injeta.
+// Skills não são mais selecionadas aqui: o Piebald injeta o catálogo nativo
+// (<available_agent_skills>) no início da sessão (removido 2026-06-15).
+func selectByEmbedding(prompt string, memFiles, memEmbed map[string]string) (mems []string, ok bool) {
 	if openrouterKey() == "" {
-		return nil, nil, false
+		return nil, false
 	}
 	// 1) garante vetores de memória, agrupando por dir físico (um sidecar por dir)
 	memVecs := map[string][]float32{}
@@ -340,26 +340,19 @@ func selectByEmbedding(prompt string, memFiles, memEmbed, skDescs map[string]str
 			memVecs[dispOfFname[dir][fname]] = v
 		}
 	}
-	// 2) garante vetores de skills (sidecar único)
-	skItems := map[string]string{}
-	for name, d := range skDescs {
-		skItems[name] = name + " :: " + d
-	}
-	skVecs, _ := ensureVectors(skItems, skillVecPath, 4*time.Second)
 
-	if len(memVecs) == 0 && len(skVecs) == 0 {
-		return nil, nil, false
+	if len(memVecs) == 0 {
+		return nil, false
 	}
-	// 3) embeda a query 1× (é a chamada que decide o cap de latência do /select)
+	// 2) embeda a query 1× (é a chamada que decide o cap de latência do /select)
 	qv, err := embedTexts([]string{prompt}, 5*time.Second)
 	if err != nil || len(qv) == 0 || len(qv[0]) == 0 {
-		return nil, nil, false
+		return nil, false
 	}
 	q := qv[0]
 	cutoff := currentCutoff()
 	mems = topCosine(q, memVecs, maxMem, cutoff)
-	skills = topCosine(q, skVecs, maxSkill, cutoff)
-	return mems, skills, true
+	return mems, true
 }
 
 // ---- migração / warmup: re-embeda tudo (global + projetos + skills) ---------
